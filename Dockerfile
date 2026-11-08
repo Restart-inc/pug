@@ -1,68 +1,31 @@
-# syntax=docker/dockerfile:1
-#
-# One parameterized image per pug role. `CMD` selects which ./cmd/<CMD> main to
-# compile; the runtime target selects the filesystem shape:
-#   --build-arg CMD=server                 --target app      -> pug-server
-#   --build-arg CMD=workers/events         --target worker   -> pug-worker-events
-#   --build-arg CMD=migrate/postgres       --target migrate  -> pug-migrate-postgres
-#
-# app target     = distroless + binary only (server reads nothing from schema/).
-# worker target  = distroless + binary + schema/nats (each worker role built here reads
-#                  schema/nats/consumers.yaml at startup via GetConsumerConfigByName).
-# migrate target = distroless + binary + schema/ (migrate roles read these from WORKDIR).
-# The sqlc query files under schema/postgres/queries are build-time only, omitted everywhere.
-#
-# Multi-arch (amd64 + arm64) via Go cross-compilation: the build stage runs on the
-# native builder arch ($BUILDPLATFORM) and cross-compiles to $TARGETARCH (no QEMU).
+# --- Stage 1: Build the React Frontend ---
+FROM oven/bun:latest AS frontend-build
+RUN git clone https://github.com/pug-sh/app.git /app-ui
+WORKDIR /app-ui
+RUN bun install
+# Pass the backend URL or configure build variables if needed
+ENV VITE_API_BASE_URL=https://pug.restart.ng
+RUN bun run build
 
-ARG CMD=server
-
-# ---- build ----
-FROM --platform=$BUILDPLATFORM golang:1.27.3-trixie@sha256:2336eda24930976591abea806d9b7d99eeae38238f19755c5deec02facdc1594 AS build
-WORKDIR /src
-
-# Module download as its own cached layer (only re-runs when go.mod/go.sum change).
-COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
-
+# --- Stage 2: Build the Go Backend ---
+FROM golang:1.22-alpine AS backend-build
+WORKDIR /app
 COPY . .
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/pug ./cmd/server
 
-ARG CMD
-ARG TARGETOS
-ARG TARGETARCH
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${CMD}
-
-# ---- app runtime: server only, binary only (reads nothing from schema/) ----
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329 AS app
+# --- Stage 3: Final Runtime Image ---
+FROM alpine:latest
 WORKDIR /app
-COPY --from=build /out/app /app/app
-# Documents the default server port (PUG_SERVER_PORT). Informational only.
+
+# Install ca-certificates for secure HTTPS requests
+RUN apk --no-cache add ca-certificates
+
+# Copy compiled Go binary
+COPY --from=backend-build /bin/pug /app/pug
+
+# Copy built React frontend static files (if your Go server is configured to serve static assets from a specific directory, e.g., /app/dist)
+COPY --from=frontend-build /app-ui/dist /app/dist
+
 EXPOSE 3000
-USER nonroot:nonroot
-ENTRYPOINT ["/app/app"]
-
-# ---- worker runtime: binary + nats config (schema/nats) ----
-# Workers are NATS consumers (no HTTP port). Each reads schema/nats/consumers.yaml at
-# startup (GetConsumerConfigByName), resolved relative to cwd — so WORKDIR must stay /app.
-# The whole schema/nats dir is copied for simplicity; streams.yaml rides along but is read
-# only by the migrate/nats role, not by workers.
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329 AS worker
-WORKDIR /app
-COPY --from=build /src/schema/nats ./schema/nats
-COPY --from=build /out/app /app/app
-USER nonroot:nonroot
-ENTRYPOINT ["/app/app"]
-
-# ---- migrate runtime: binary + schema assets ----
-# WORKDIR must stay /app so the migrate roles resolve schema/ relative to cwd.
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329 AS migrate
-WORKDIR /app
-COPY --from=build /src/schema/postgres/migrations   ./schema/postgres/migrations
-COPY --from=build /src/schema/clickhouse/migrations ./schema/clickhouse/migrations
-COPY --from=build /src/schema/nats                  ./schema/nats
-COPY --from=build /out/app /app/app
-USER nonroot:nonroot
-ENTRYPOINT ["/app/app"]
+CMD ["./pug"]
