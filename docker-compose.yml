@@ -1,85 +1,31 @@
-version: '3.8'
+# --- Stage 1: Build the React Frontend ---
+FROM oven/bun:latest AS frontend-build
+RUN git clone https://github.com/pug-sh/app.git /app-ui
+WORKDIR /app-ui
+RUN bun install
+# Pass the backend URL or configure build variables if needed
+ENV VITE_API_BASE_URL=https://pug.restart.ng
+RUN bun run build
 
-services:
-  pug:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: pug-app
-    restart: unless-stopped
-    ports:
-      - "3000:3000"
-    environment:
-      - PUG_JWT_SECRET_KEY=${PUG_JWT_SECRET_KEY}
-      - DATABASE_URL=postgres://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/pug?sslmode=disable
-      - CLICKHOUSE_URL=clickhouse://default:${CLICKHOUSE_PASSWORD:-default}@clickhouse:9000/pug
-      - NATS_URL=nats://nats:4222
-      - REDIS_URL=redis://redis:6379
-      - PUG_SERVER_PORT=3000
-      - PUG_CORS_ORIGINS=${PUG_CORS_ORIGINS:-https://pug.restart.ng}
-      - PUG_DASHBOARD_BASE_URL=${PUG_DASHBOARD_BASE_URL:-https://pug.restart.ng}
-    depends_on:
-      - postgres
-      - clickhouse
-      - redis
-      - nats
-    networks:
-      - pug-net
+# --- Stage 2: Build the Go Backend ---
+FROM golang:1.22-alpine AS backend-build
+WORKDIR /app
+COPY . .
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/pug ./cmd/server
 
-  postgres:
-    image: postgres:15-alpine
-    container_name: pug-postgres
-    restart: unless-stopped
-    environment:
-      - POSTGRES_DB=pug
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    networks:
-      - pug-net
+# --- Stage 3: Final Runtime Image ---
+FROM alpine:latest
+WORKDIR /app
 
-  clickhouse:
-    image: clickhouse/clickhouse-server:latest
-    container_name: pug-clickhouse
-    restart: unless-stopped
-    environment:
-      - CLICKHOUSE_DB=pug
-      - CLICKHOUSE_USER=default
-      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
-      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-default}
-    volumes:
-      - clickhouse_data:/var/lib/clickhouse
-      - clickhouse_logs:/var/log/clickhouse-server
-    networks:
-      - pug-net
+# Install ca-certificates for secure HTTPS requests
+RUN apk --no-cache add ca-certificates
 
-  redis:
-    image: redis:alpine
-    container_name: pug-redis
-    restart: unless-stopped
-    volumes:
-      - redis_data:/data
-    networks:
-      - pug-net
+# Copy compiled Go binary
+COPY --from=backend-build /bin/pug /app/pug
 
-  nats:
-    image: nats:latest
-    container_name: pug-nats
-    restart: unless-stopped
-    command: ["-js"]
-    volumes:
-      - nats_data:/data
-    networks:
-      - pug-net
+# Copy built React frontend static files (if your Go server is configured to serve static assets from a specific directory, e.g., /app/dist)
+COPY --from=frontend-build /app-ui/dist /app/dist
 
-volumes:
-  postgres_data:
-  clickhouse_data:
-  clickhouse_logs:
-  redis_data:
-  nats_data:
-
-networks:
-  pug-net:
-    driver: bridge
+EXPOSE 3000
+CMD ["./pug"]
