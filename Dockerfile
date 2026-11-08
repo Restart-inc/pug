@@ -1,31 +1,20 @@
-# --- Build Stage ---
-FROM golang:1.22-alpine AS builder
+# syntax=docker/dockerfile:1
+FROM golang:1.27.3-alpine AS build
 
-WORKDIR /app
+WORKDIR /src
 
-# Install git and build essentials
-RUN apk add --no-cache git make
-
-# Copy go.mod and go.sum files first for caching dependencies
+# Download dependencies in a cached layer
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy the rest of the source code
+# Copy source code and build
 COPY . .
+RUN CGO_ENABLED=0 go build -o /bin/pug ./cmd/server
 
-# Build the server binary
-RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/pug ./cmd/server
-
-# --- Runtime Stage ---
+# Runtime image
 FROM alpine:latest
-
-WORKDIR /app
-
 RUN apk --no-cache add ca-certificates
-
-# Copy binary from builder
-COPY --from=builder /bin/pug /app/pug
+COPY --from=build /bin/pug /bin/pug
 
 EXPOSE 3000
-
-CMD ["./pug"]
+CMD ["/bin/pug", "start"]
