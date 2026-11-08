@@ -1,28 +1,31 @@
-# --- Stage 1: Build the React Frontend ---
-FROM oven/bun:latest AS frontend-build
+# --- Build Stage ---
+FROM golang:1.22-alpine AS builder
 
-# Install git so the clone command succeeds
-RUN apt-get update && apt-get install -y git || (apt-get install -y apk-tools && apk add --no-cache git)
-
-RUN git clone https://github.com/pug-sh/app.git /app-ui
-WORKDIR /app-ui
-RUN bun install
-ENV VITE_API_BASE_URL=https://pug.restart.ng
-RUN bun run build
-
-# --- Stage 2: Build the Go Backend ---
-FROM golang:1.22-alpine AS backend-build
 WORKDIR /app
-COPY . .
+
+# Install git and build essentials
+RUN apk add --no-cache git make
+
+# Copy go.mod and go.sum files first for caching dependencies
+COPY go.mod go.sum ./
 RUN go mod download
+
+# Copy the rest of the source code
+COPY . .
+
+# Build the server binary
 RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/pug ./cmd/server
 
-# --- Stage 3: Final Runtime Image ---
+# --- Runtime Stage ---
 FROM alpine:latest
+
 WORKDIR /app
+
 RUN apk --no-cache add ca-certificates
-COPY --from=backend-build /bin/pug /app/pug
-COPY --from=frontend-build /app-ui/dist /app/dist
+
+# Copy binary from builder
+COPY --from=builder /bin/pug /app/pug
 
 EXPOSE 3000
+
 CMD ["./pug"]
